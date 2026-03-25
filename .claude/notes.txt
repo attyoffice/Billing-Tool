@@ -1,0 +1,31 @@
+feb 21
+
+some changes to the file
+
+1. I need the software to be able to take not just csv format files but also xlsx, etc. i want it to be able to support multiple formats of sheets
+2. add feature where user can also drop the file into a drop box besides selecting file to upload
+3. round the hours down to the nearst 0.1 hr
+4. I want the software to stay until user click the cross to close it. so that user doesn't have to re-upload the file or reopen the softawre everytime they switch to a different tab or window
+5. the new file will come with a column called "Is Time Entires Selected", I want to skip/delete this column when processing the file
+6. the hours in the file will be under the column called "hrs." not "Hours"
+7. the last row of the file shows the total hrs, it's not related and should be skipped/deleted when processing the file 
+8. there will be no "matters" column in the file anymore
+9. organized the uploaded file by different clients, which will show up under the "contact" column. Then combined the entries where the item and date and client are all the same.
+10.to add a entry, click plus sign that says add new record, then populate the date in format of m/d/yyyy, Under colume "item" are the numbers Activity Code Mapping, only fill out for what's been built, leave the rest blank, then save
+11.there will be a new column in the file called descriptions, in this column there will be information about traveling if the item is travel(12) and you need to add this travel info on a date's entry, for example, locationX to locationX, ReasonX. for adding travels on that date, after putting in the hours for each items, save first, then click Travel, then click Add new record, then click drop down bar (select a reason), pick from Court, Investigation, Research, Client Visit from description. then for from, (select a city), pick the city in the description(it can be in the state or out of state, if select out of states there will a new dropdown bar named (Enter City) which allow you to type, then after it a drop down menu (state) to select state), then To the same as before, then click if round trip, delay for a few seconds, then time entry(Time), then save. after all travels on the same date are filled by their reasons, Close Form. back to the time entry if afterward there's a popup window just click ok. after all travel is filled out this, click Close Form, then back to the time entry. all the travels happened on the same date will be going into that date's entry, and different travel items on the same date can be broken by the reasons while filling out the travel part. 
+
+find the client using the name under contact column, click edit                                          
+detect time constraints for each item
+
+- Add new record
+- then populate the date 
+
+
+
+
+
+New column
+Description
+if travel is the item
+
+
