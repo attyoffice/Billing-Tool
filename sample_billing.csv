@@ -1,0 +1,13 @@
+Activity,Status,Date,Description,Hours,Rate,Billed By,Matter
+"03 Trial / Hearing",Billable,8/13/2025,"08:59-9:35 Docket call",0.6,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"09 Negotiat",Billable,8/13/2025,"09:36-10:00 Mtng with the DCF and case worker",0.4,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"03 Trial / Hearing",Billable,8/13/2025,"10:00-10:13 Hearing",0.2,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"08 Client Contact in Person/Telephone",Billable,8/13/2025,"10:14-10:45 Meet with client, father",0.5,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"09 Negotiat",Billable,8/13/2025,"10:45-11:00 Second Call See AAM",0.3,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"08 Client Contact in Person/Telephone",Billable,8/13/2025,"11:02-11:23 Meet with client and his mother",0.4,95,George Mulgrew,"James William CalvaColumbus 25JV00341"
+"12 Travel",Billable,8/13/2025,"Travel to courthouse",0.5,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"03 Trial / Hearing",Billable,8/14/2025,"09:00-10:30 Adjudicatory hearing",1.5,95,George Mulgrew,"James William CalvaColumbus 25JV00341"
+"06 Hrg/Tri Prep+Disco",Billable,8/14/2025,"08:00-08:45 Prep for hearing",0.8,95,George Mulgrew,"James William CalvaColumbus 25JV00341"
+"09 Negotiat",Billable,8/14/2025,"10:35-11:00 Discussion with prosecutor",0.4,95,George Mulgrew,"James William CalvaColumbus 25JV00341"
+"10 Legal Research",Billable,8/15/2025,"14:00-15:30 Research custody standards",1.5,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"
+"05 Dft Pleadings/Cor",Billable,8/15/2025,"15:30-16:15 Draft motion to continue",0.8,95,George Mulgrew,"Thomas and Nicholas Shall Shallow 25CPO034"

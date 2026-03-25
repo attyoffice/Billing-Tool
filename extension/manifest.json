@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Ebill Auto-Filler",
+  "version": "1.1.0",
+  "description": "Automatically fill ebill.publiccounsel.net from billing exports (CSV / XLSX)",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "windows",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://ebill.publiccounsel.net/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Ebill Auto-Filler"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://ebill.publiccounsel.net/*"],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ]
+}

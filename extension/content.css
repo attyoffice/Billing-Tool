@@ -1,0 +1,10 @@
+/* Content styles for ebill auto-filler */
+/* Highlight filled fields */
+.ebill-filler-highlight {
+  background-color: #c6f6d5 !important;
+  transition: background-color 0.5s;
+}
+
+.ebill-filler-highlight-error {
+  background-color: #fed7d7 !important;
+}

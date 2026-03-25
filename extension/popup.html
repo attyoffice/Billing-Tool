@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Ebill Auto-Filler</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Ebill Auto-Filler</h1>
+
+    <!-- ── File Upload ── -->
+    <div id="upload-section">
+      <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone-content">
+          <div class="drop-icon">📂</div>
+          <div class="drop-text">Drop billing file here</div>
+          <div class="drop-sub">or</div>
+          <label for="file-input" class="file-label-btn">Browse File</label>
+          <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.tsv,.txt">
+          <div id="file-name" class="file-name-display">No file selected</div>
+          <div class="drop-formats">Supported: CSV · XLSX · TSV</div>
+        </div>
+      </div>
+      <button id="parse-btn" disabled>Parse File</button>
+    </div>
+
+    <!-- ── Status ── -->
+    <div id="status-section" class="hidden">
+      <div id="status-message"></div>
+    </div>
+
+    <!-- ── Preview ── -->
+    <div id="preview-section" class="hidden">
+      <h2>Parsed Entries</h2>
+      <div id="summary"></div>
+      <div id="entries-list"></div>
+      <div id="validation-errors" class="errors hidden"></div>
+      <button id="fill-btn" class="primary">Fill Ebill Form</button>
+    </div>
+
+    <!-- ── Instructions ── -->
+    <div id="instructions" class="instructions">
+      <p><strong>Instructions:</strong></p>
+      <ol>
+        <li>Export billing data (CSV or XLSX) and drop it above or click Browse</li>
+        <li>Click <em>Parse File</em> to review the organised entries</li>
+        <li>Navigate to ebill.publiccounsel.net and open the case</li>
+        <li>Click <em>Fill Ebill Form</em> — this window will stay open</li>
+      </ol>
+    </div>
+  </div>
+
+  <script src="xlsx_reader.js"></script>
+  <script src="parser.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

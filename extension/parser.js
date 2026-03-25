@@ -1,0 +1,440 @@
+/**
+ * Parser for billing CSV/XLSX exports
+ * Maps activity item codes to ebill.publiccounsel.net categories
+ *
+ * New file format columns:
+ *   "Is Time Entries Selected" — ignored/skipped
+ *   "Date"                     — entry date
+ *   "Contact"                  — client name (groups entries)
+ *   "Item"                     — activity code number (1–13)
+ *   "hrs."                     — hours worked
+ *   "Descriptions"             — notes; contains travel info for item 12
+ */
+
+// Activity code → ebill category key
+const ACTIVITY_MAPPING = {
+  '01': 'emergency_hearing',
+  '02': 'pre_tri_hrg_conf',
+  '03': 'trial_hearing',
+  '04': 'dispo_proceedings',
+  '05': 'dft_pleadings_cor',
+  '06': 'hrg_tri_prep_disco',
+  '07': 'court_waiting_time',
+  '08': 'in_prsn_clt_contact',
+  '09': 'negot_case_conf',
+  '10': 'legal_research',
+  '11': 'investigation',
+  '12': 'travel',
+  '13': 'other_clt_contact',
+};
+
+const CATEGORY_DISPLAY_NAMES = {
+  'emergency_hearing':   'Emergency Hearing',
+  'pre_tri_hrg_conf':    'Pre-Tri Hrg/Conf',
+  'trial_hearing':       'Trial/Hearing',
+  'dispo_proceedings':   'Dispo. Proceedings',
+  'dft_pleadings_cor':   'Dft Pleadings/Cor',
+  'hrg_tri_prep_disco':  'Hrg/Tri Prep+Disco',
+  'court_waiting_time':  'Court Waiting Time',
+  'in_prsn_clt_contact': 'In Prsn Clt Contact',
+  'negot_case_conf':     'Negot/Case Conf',
+  'legal_research':      'Legal Research',
+  'investigation':       'Investigation',
+  'travel':              'Travel',
+  'other_clt_contact':   'Other Clt Contact',
+};
+
+const TRAVEL_REASONS = ['Court', 'Investigation', 'Research', 'Client Visit'];
+
+/* ── Rounding ─────────────────────────────────────────────────────── */
+
+/**
+ * Round hours DOWN to the nearest 0.1 hr.
+ * e.g. 1.37 → 1.3,  0.98 → 0.9,  2.40 → 2.4
+ */
+function roundHours(hours) {
+  return Math.floor(Math.round(hours * 1000) / 100) / 10;
+}
+
+/* ── Date parsing ─────────────────────────────────────────────────── */
+
+/**
+ * Convert an Excel date serial number to M/D/YYYY string.
+ * Excel epoch is Jan 1, 1900 = serial 1 (with the "1900 leap year" bug).
+ */
+function excelSerialToDate(serial) {
+  const d = new Date(Date.UTC(1900, 0, 1));
+  d.setUTCDate(d.getUTCDate() + serial - (serial >= 60 ? 2 : 1));
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+
+/**
+ * Parse a date string to M/D/YYYY format.
+ * Accepts: "8/13/2025", "08/13/2025", "2025-08-13", or Excel serial numbers.
+ */
+function parseDate(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  const s = dateStr.trim();
+
+  // M/D/YYYY or MM/DD/YYYY
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return `${parseInt(m[1])}/${parseInt(m[2])}/${m[3]}`;
+
+  // YYYY-MM-DD
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return `${parseInt(m[2])}/${parseInt(m[3])}/${m[1]}`;
+
+  // Excel date serial number (plausible range: 1990–2070)
+  const num = parseInt(s, 10);
+  if (!isNaN(num) && String(num) === s && num >= 32874 && num <= 62091) {
+    return excelSerialToDate(num);
+  }
+
+  return null;
+}
+
+/* ── Activity code ────────────────────────────────────────────────── */
+
+/**
+ * Extract a 2-digit activity code from the "Item" column.
+ * The column may contain just a number ("12") or number + label ("12 Travel").
+ */
+function extractActivityCode(itemStr) {
+  if (!itemStr && itemStr !== 0) return null;
+  const s = String(itemStr).trim();
+  const m = s.match(/^(\d{1,2})/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (n < 1 || n > 13) return null;
+  return n.toString().padStart(2, '0');
+}
+
+/* ── Travel description parsing ───────────────────────────────────── */
+
+/**
+ * Parse a travel description string into structured travel info.
+ * Expected format examples:
+ *   "Los Angeles to Sacramento, Court"
+ *   "Office to Court House, Investigation"
+ *   "Downtown to Airport, Client Visit"
+ *
+ * Returns { fromCity, toCity, reason } or null if not parseable.
+ */
+function parseTravelDescription(description) {
+  if (!description) return null;
+
+  let reason = null;
+  for (const r of TRAVEL_REASONS) {
+    if (description.toLowerCase().includes(r.toLowerCase())) {
+      reason = r;
+      break;
+    }
+  }
+
+  // "X to Y" pattern (case-insensitive); capture up to a comma or end
+  const m = description.match(/^(.+?)\s+to\s+(.+?)(?:\s*,|$)/i);
+  const fromCity = m ? m[1].trim() : null;
+  const toCity   = m ? m[2].trim() : null;
+
+  if (!reason && !fromCity) return null;
+  return { fromCity, toCity, reason };
+}
+
+/* ── CSV parsing ──────────────────────────────────────────────────── */
+
+/** Parse a single CSV line, handling quoted values and embedded commas. */
+function parseCSVRow(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+/** Parse TSV (tab-separated) — simple split, no quoting needed. */
+function parseTSVRow(line) {
+  return line.split('\t').map(s => s.trim());
+}
+
+/**
+ * Parse CSV/TSV text content into an array of rows (each row = array of strings).
+ * Returns { rows, errors }.
+ */
+function parseDelimited(content) {
+  const lines = content.split(/\r?\n/);
+  if (lines.length < 2) return { rows: [], errors: ['File is empty or has no data rows'] };
+
+  // Detect delimiter: if header contains a tab, it's TSV
+  const parseRow = lines[0].includes('\t') ? parseTSVRow : parseCSVRow;
+
+  const rows = [];
+  for (const line of lines) {
+    if (line.trim()) rows.push(parseRow(line));
+  }
+  return { rows, errors: [] };
+}
+
+/* ── Core row processing ──────────────────────────────────────────── */
+
+/**
+ * Given a 2-D array of rows (first row = headers), process into entry objects.
+ * - Skips the "Is Time Entries Selected" column
+ * - Skips any row where item is blank
+ * - Skips the LAST non-empty row (total hours row)
+ * - Floors hours to 0.1
+ */
+function processRows(rows) {
+  if (rows.length < 2) return { entries: [], errors: ['No data rows found'] };
+
+  const headers = rows[0];
+  const headerMap = {};
+  headers.forEach((h, i) => {
+    if (h) headerMap[h.toLowerCase().trim()] = i;
+  });
+
+  // Flexible column finder — tries each name in order
+  const findColumn = (...names) => {
+    for (const name of names) {
+      for (const [key, idx] of Object.entries(headerMap)) {
+        if (key.includes(name.toLowerCase())) return idx;
+      }
+    }
+    return -1;
+  };
+
+  const cols = {
+    date:        findColumn('date'),
+    contact:     findColumn('contact'),
+    item:        findColumn('item'),
+    hours:       findColumn('hrs.', 'hrs', 'hours', 'time', 'duration'),
+    description: findColumn('descriptions', 'description', 'desc', 'notes'),
+    // "Is Time Entries Selected" is deliberately not mapped — it's ignored
+  };
+
+  const errors = [];
+  if (cols.date < 0)    errors.push('Column "Date" not found');
+  if (cols.contact < 0) errors.push('Column "Contact" not found');
+  if (cols.item < 0)    errors.push('Column "Item" not found');
+  if (cols.hours < 0)   errors.push('Column "hrs." not found');
+  if (errors.length)    return { entries: [], errors };
+
+  // All data rows except the last one (which is the total-hours summary row)
+  const dataRows = rows.slice(1).filter(r => r.some(c => c.trim()));
+  const rowsToProcess = dataRows.slice(0, -1); // drop last row (totals)
+
+  const entries = [];
+  const warnings = [];
+
+  rowsToProcess.forEach((row, idx) => {
+    const rowNum = idx + 2; // 1-based, accounting for header
+
+    // Skip rows with blank item (not an activity entry)
+    const itemVal = cols.item >= 0 ? row[cols.item] : '';
+    if (!itemVal || !itemVal.trim()) return;
+
+    const activityCode = extractActivityCode(itemVal);
+    if (!activityCode) {
+      warnings.push(`Row ${rowNum}: unrecognised item value "${itemVal}" — skipped`);
+      return;
+    }
+
+    // Date
+    const dateStr = cols.date >= 0 ? row[cols.date] : '';
+    const date = parseDate(dateStr);
+    if (!date) {
+      warnings.push(`Row ${rowNum}: invalid date "${dateStr}" — skipped`);
+      return;
+    }
+
+    // Hours
+    const hoursRaw = cols.hours >= 0 ? row[cols.hours] : '';
+    const hoursNum = parseFloat(hoursRaw);
+    if (isNaN(hoursNum) || hoursNum <= 0) {
+      warnings.push(`Row ${rowNum}: invalid or zero hours "${hoursRaw}" — skipped`);
+      return;
+    }
+    const hours = roundHours(hoursNum);
+    if (hours <= 0) {
+      warnings.push(`Row ${rowNum}: hours rounded to 0 (was ${hoursNum}) — skipped`);
+      return;
+    }
+
+    // Client
+    const contact = cols.contact >= 0 ? row[cols.contact].trim() : '';
+    if (!contact) {
+      warnings.push(`Row ${rowNum}: blank contact — skipped`);
+      return;
+    }
+
+    // Description (may contain travel info)
+    const description = cols.description >= 0 ? row[cols.description].trim() : '';
+
+    const category = ACTIVITY_MAPPING[activityCode] || 'other_clt_contact';
+
+    // Parse travel details when item is 12
+    let travelInfo = null;
+    if (activityCode === '12' && description) {
+      travelInfo = parseTravelDescription(description);
+    }
+
+    entries.push({
+      date,
+      contact,        // client name
+      activityCode,
+      category,
+      categoryDisplay: CATEGORY_DISPLAY_NAMES[category] || category,
+      hours,
+      description,
+      travelInfo,
+      rowNum,
+    });
+  });
+
+  return { entries, errors: [], warnings };
+}
+
+/* ── Aggregation & grouping ───────────────────────────────────────── */
+
+/**
+ * Combine entries that share the same client + date + item.
+ * Hours are summed then floored to 0.1.
+ * Travel infos from combined rows are merged into an array.
+ */
+function aggregateEntries(entries) {
+  const map = {};
+
+  entries.forEach(entry => {
+    const key = `${entry.contact}|${entry.date}|${entry.activityCode}`;
+    if (!map[key]) {
+      map[key] = {
+        ...entry,
+        hours: entry.hours,
+        descriptions: [entry.description],
+        travelInfos: entry.travelInfo ? [entry.travelInfo] : [],
+      };
+    } else {
+      map[key].hours += entry.hours;
+      if (entry.description) map[key].descriptions.push(entry.description);
+      if (entry.travelInfo)  map[key].travelInfos.push(entry.travelInfo);
+    }
+  });
+
+  return Object.values(map).map(entry => ({
+    ...entry,
+    hours: roundHours(entry.hours),
+    description: entry.descriptions.filter(Boolean).join('; '),
+    // Keep unique travel infos
+    travelInfos: entry.travelInfos,
+  }));
+}
+
+/**
+ * Group aggregated entries by client (contact).
+ * Returns { [contactName]: { contact, entries[], totalHours } }
+ */
+function groupByClient(entries) {
+  const groups = {};
+
+  entries.forEach(entry => {
+    if (!groups[entry.contact]) {
+      groups[entry.contact] = {
+        contact: entry.contact,
+        entries: [],
+        totalHours: 0,
+      };
+    }
+    groups[entry.contact].entries.push(entry);
+    groups[entry.contact].totalHours += entry.hours;
+  });
+
+  Object.values(groups).forEach(g => {
+    g.totalHours = roundHours(g.totalHours);
+  });
+
+  return groups;
+}
+
+/* ── Main entry point ─────────────────────────────────────────────── */
+
+/**
+ * Process billing file content (CSV/TSV text, or 2-D array from XLSX).
+ * @param {string|Array} input — CSV/TSV string, or already-parsed 2-D array
+ * @returns result object with success, entries, groups, summary, warnings, errors
+ */
+function processBillingFile(input) {
+  let rows;
+  let parseErrors = [];
+
+  if (Array.isArray(input)) {
+    // Already a 2-D array (from xlsx_reader.js)
+    rows = input;
+  } else {
+    // CSV or TSV text
+    const parsed = parseDelimited(input);
+    rows = parsed.rows;
+    parseErrors = parsed.errors;
+  }
+
+  if (parseErrors.length) {
+    return { success: false, errors: parseErrors, entries: [], groups: {} };
+  }
+
+  const { entries: rawEntries, errors: rowErrors, warnings } = processRows(rows);
+
+  if (rowErrors.length) {
+    return { success: false, errors: rowErrors, entries: [], groups: {}, warnings: warnings || [] };
+  }
+
+  if (rawEntries.length === 0) {
+    return {
+      success: false,
+      errors: ['No valid entries found — check that the file has the expected columns (Date, Contact, Item, hrs.)'],
+      entries: [],
+      groups: {},
+      warnings: warnings || [],
+    };
+  }
+
+  const aggregated = aggregateEntries(rawEntries);
+  const groups = groupByClient(aggregated);
+  const totalHours = roundHours(aggregated.reduce((s, e) => s + e.hours, 0));
+
+  return {
+    success: true,
+    errors: [],
+    warnings: warnings || [],
+    entries: aggregated,
+    groups,
+    summary: {
+      originalEntries:   rawEntries.length,
+      aggregatedEntries: aggregated.length,
+      totalHours,
+      clientCount:       Object.keys(groups).length,
+    },
+  };
+}
+
+// Expose to popup.js
+if (typeof window !== 'undefined') {
+  window.BillingParser = {
+    processBillingFile,
+    roundHours,
+    parseDate,
+    parseTravelDescription,
+    CATEGORY_DISPLAY_NAMES,
+    TRAVEL_REASONS,
+  };
+}
