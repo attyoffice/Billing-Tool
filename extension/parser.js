@@ -130,82 +130,157 @@ function extractClientName(contactStr) {
 /* ── Travel description parsing ───────────────────────────────────── */
 
 /**
- * Parse a travel description string into structured travel info.
- * Expected format examples:
- *   "Los Angeles to Sacramento, Court"
- *   "Office to Court House, Investigation"
- *   "Downtown to Airport, Client Visit"
+ * Parse a travel description into structured travel info.
  *
- * Returns { fromCity, toCity, reason } or null if not parseable.
+ * Handles PracticePanther formats such as:
+ *   "15:17-15:59 Travel from Carlisle to Lawrence for client meeting."
+ *   "10:56-11:50\n\nTravel from Carlisle to Georgetown for client visit RT."
+ *   "Travel from Carlisle to Natick for client visit RT"
+ *   "Los Angeles to Sacramento, Court"
+ *
+ * Returns { fromCity, toCity, reason, isRoundTrip } or null if nothing useful found.
  */
 function parseTravelDescription(description) {
   if (!description) return null;
 
+  // 1. Normalize multiline content and collapse whitespace
+  let text = description.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // 2. Strip leading time range  e.g. "15:17-15:59" or "10:56-11:50"
+  text = text.replace(/^\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}\s*/i, '').trim();
+
+  // 3. Strip leading "Travel [back]" keyword
+  text = text.replace(/^travel\s+(back\s+)?/i, '').trim();
+
+  // 4. Round-trip detection ("RT" abbreviation or "round trip" phrase)
+  const isRoundTrip = /\bRT\b/.test(text) || /round\s*trip/i.test(text);
+
+  // 5. Reason detection (most-specific patterns first)
+  const REASON_PATTERNS = [
+    { re: /\bclient\s+(visit|meeting)\b/i, reason: 'Client Visit' },
+    { re: /\bcourt\b/i,                    reason: 'Court'        },
+    { re: /\binvestigation\b/i,            reason: 'Investigation'},
+    { re: /\bresearch\b/i,                 reason: 'Research'     },
+  ];
   let reason = null;
-  for (const r of TRAVEL_REASONS) {
-    if (description.toLowerCase().includes(r.toLowerCase())) {
-      reason = r;
-      break;
-    }
+  for (const { re, reason: r } of REASON_PATTERNS) {
+    if (re.test(text)) { reason = r; break; }
   }
 
-  // "X to Y" pattern (case-insensitive); capture up to a comma or end
-  const m = description.match(/^(.+?)\s+to\s+(.+?)(?:\s*,|$)/i);
-  const fromCity = m ? m[1].trim() : null;
-  const toCity   = m ? m[2].trim() : null;
+  // 6. City extraction
+  //    Try "from X to Y [for / RT / punctuation / end]" first, then plain "X to Y"
+  let fromCity = null, toCity = null;
+  let m = text.match(
+    /\bfrom\s+([A-Za-z][A-Za-z\s]+?)\s+to\s+([A-Za-z][A-Za-z\s]+?)(?=\s+for\b|\s+RT\b|\s*[.,]|$)/i
+  );
+  if (!m) {
+    m = text.match(
+      /^([A-Za-z][A-Za-z\s]+?)\s+to\s+([A-Za-z][A-Za-z\s]+?)(?=\s+for\b|\s+RT\b|\s*[.,]|$)/i
+    );
+  }
+  if (m) {
+    fromCity = m[1].trim();
+    toCity   = m[2].trim();
+  }
 
   if (!reason && !fromCity) return null;
-  return { fromCity, toCity, reason };
+  return { fromCity, toCity, reason, isRoundTrip };
 }
 
 /* ── CSV parsing ──────────────────────────────────────────────────── */
 
-/** Parse a single CSV line, handling quoted values and embedded commas. */
-function parseCSVRow(line) {
-  const result = [];
-  let current = '';
+/**
+ * Parse a full CSV string character-by-character.
+ * Correctly handles quoted fields that contain embedded commas AND newlines
+ * (e.g. PracticePanther multi-line description cells).
+ * Returns a 2-D array of trimmed strings.
+ */
+function parseCSVFull(content) {
+  const rows = [];
+  let row = [];
+  let cell = '';
   let inQuotes = false;
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else { inQuotes = !inQuotes; }
-    } else if (ch === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (content[i + 1] === '"') { cell += '"'; i++; } // escaped ""
+        else { inQuotes = false; }                         // closing quote
+      } else {
+        cell += ch; // includes embedded newlines — kept as-is
+      }
     } else {
-      current += ch;
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        row.push(cell.trim()); cell = '';
+      } else if (ch === '\r' || ch === '\n') {
+        if (ch === '\r' && content[i + 1] === '\n') i++; // skip \n of \r\n
+        row.push(cell.trim());
+        if (row.some(c => c !== '')) rows.push(row);
+        row = []; cell = '';
+      } else {
+        cell += ch;
+      }
     }
   }
-  result.push(current.trim());
-  return result;
-}
 
-/** Parse TSV (tab-separated) — simple split, no quoting needed. */
-function parseTSVRow(line) {
-  return line.split('\t').map(s => s.trim());
+  // Last row (file may not end with a newline)
+  if (cell !== '' || row.length > 0) {
+    row.push(cell.trim());
+    if (row.some(c => c !== '')) rows.push(row);
+  }
+
+  return rows;
 }
 
 /**
- * Parse CSV/TSV text content into an array of rows (each row = array of strings).
+ * Parse CSV or TSV text into a 2-D array of strings.
+ * Auto-detects delimiter from the first line.
  * Returns { rows, errors }.
  */
 function parseDelimited(content) {
-  const lines = content.split(/\r?\n/);
-  if (lines.length < 2) return { rows: [], errors: ['File is empty or has no data rows'] };
-
-  // Detect delimiter: if header contains a tab, it's TSV
-  const parseRow = lines[0].includes('\t') ? parseTSVRow : parseCSVRow;
-
-  const rows = [];
-  for (const line of lines) {
-    if (line.trim()) rows.push(parseRow(line));
+  if (!content || !content.trim()) {
+    return { rows: [], errors: ['File is empty'] };
   }
+
+  // TSV: if the header row contains a tab, split on tabs (no quoting needed)
+  const firstNewline = content.indexOf('\n');
+  const firstLine = firstNewline >= 0 ? content.slice(0, firstNewline) : content;
+  if (firstLine.includes('\t')) {
+    const rows = content.split(/\r?\n/)
+      .filter(l => l.trim())
+      .map(l => l.split('\t').map(s => s.trim()));
+    if (rows.length < 2) return { rows: [], errors: ['File has no data rows'] };
+    return { rows, errors: [] };
+  }
+
+  // CSV: use the character-by-character parser (handles multiline quoted fields)
+  const rows = parseCSVFull(content);
+  if (rows.length < 2) return { rows: [], errors: ['File is empty or has no data rows'] };
   return { rows, errors: [] };
 }
 
 /* ── Core row processing ──────────────────────────────────────────── */
+
+/**
+ * Return true if a row looks like a totals/summary row that should be skipped.
+ * A totals row typically has no valid date, no recognisable item code,
+ * or contains the word "Total".
+ */
+function isTotalsRow(row, cols) {
+  // Contains "Total" anywhere
+  if (row.some(cell => /\btotal\b/i.test(cell || ''))) return true;
+  // Date cell exists but can't be parsed as a date
+  const dateVal = (cols.date >= 0 ? row[cols.date] : '') || '';
+  if (dateVal && !parseDate(dateVal)) return true;
+  // Item cell is blank or has no recognisable activity code
+  const itemVal = (cols.item >= 0 ? row[cols.item] : '') || '';
+  if (!itemVal.trim() || !extractActivityCode(itemVal)) return true;
+  return false;
+}
 
 /**
  * Given a 2-D array of rows (first row = headers), process into entry objects.
@@ -250,9 +325,14 @@ function processRows(rows) {
   if (cols.hours < 0)   errors.push('Column "hrs." not found');
   if (errors.length)    return { entries: [], errors };
 
-  // All data rows except the last one (which is the total-hours summary row)
-  const dataRows = rows.slice(1).filter(r => r.some(c => c.trim()));
-  const rowsToProcess = dataRows.slice(0, -1); // drop last row (totals)
+  // All non-empty data rows
+  const dataRows = rows.slice(1).filter(r => r.some(c => c && c.trim()));
+
+  // Drop the last row only if it looks like a totals/summary row.
+  // (Some exports append a total-hours row; others don't — don't blindly drop.)
+  const lastRow = dataRows[dataRows.length - 1];
+  const lastIsTotals = lastRow && isTotalsRow(lastRow, cols);
+  const rowsToProcess = lastIsTotals ? dataRows.slice(0, -1) : dataRows;
 
   const entries = [];
   const warnings = [];

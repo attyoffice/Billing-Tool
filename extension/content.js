@@ -222,9 +222,9 @@ async function addTravelRecord(entry, seg) {
     await delay(200);
   }
 
-  // Round trip — check if description mentions "round trip"
-  const isRoundTrip = entry.description &&
-    entry.description.toLowerCase().includes('round trip');
+  // Round trip — from parsed travel info or fallback to description text
+  const isRoundTrip = seg.isRoundTrip ||
+    (entry.description && /\bRT\b|round\s*trip/i.test(entry.description));
   if (isRoundTrip) {
     const rtCheck = findCheckboxByLabel('round') || document.querySelector('input[type="checkbox"]');
     if (rtCheck && !rtCheck.checked) {
