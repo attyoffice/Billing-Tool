@@ -147,9 +147,9 @@ const XLSXReader = (() => {
         const colN   = colToNum(colStr);
         if (colN > maxCol) maxCol = colN;
 
-        const isStr    = /\bt="s"\b/.test(attrs);
-        const isInline = /\bt="(?:inlineStr|str)"\b/.test(attrs);
-        const isBool   = /\bt="b"\b/.test(attrs);
+        const isStr    = /\bt="s"/.test(attrs);
+        const isInline = /\bt="(?:inlineStr|str)"/.test(attrs);
+        const isBool   = /\bt="b"/.test(attrs);
 
         const vMatch = inner.match(/<v>([^<]*)<\/v>/);
         const tMatch = inner.match(/<t(?:\s[^>]*)?>([^<]*)<\/t>/);
