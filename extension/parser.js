@@ -1,14 +1,19 @@
 /**
- * Parser for billing CSV/XLSX exports
+ * Parser for PracticePanther billing exports (CSV / XLSX)
  * Maps activity item codes to ebill.publiccounsel.net categories
  *
- * New file format columns:
- *   "Is Time Entries Selected" — ignored/skipped
- *   "Date"                     — entry date
- *   "Contact"                  — client name (groups entries)
- *   "Item"                     — activity code number (1–13)
- *   "hrs."                     — hours worked
- *   "Descriptions"             — notes; contains travel info for item 12
+ * Expected columns (order doesn't matter):
+ *   "Is Time Entries Selected" — ignored
+ *   "Item"                     — activity code, e.g. "05 Draft Cor" or "12 Travel"
+ *   "Status"                   — only "Billable" rows are processed; others are skipped
+ *   "Date"                     — entry date (M/D/YYYY or YYYY-MM-DD or Excel serial)
+ *   "Description"              — notes; travel entries contain "City to City, Reason"
+ *   "hrs."                     — hours worked (floored to 0.1)
+ *   "Rate"                     — ignored
+ *   "Total"                    — ignored
+ *   "Billed By"                — ignored
+ *   "Contact"                  — client name, may be prefixed "2658 - Paige Resendez"
+ *   "Matter"                   — ignored
  */
 
 // Activity code → ebill category key
@@ -107,6 +112,19 @@ function extractActivityCode(itemStr) {
   const n = parseInt(m[1], 10);
   if (n < 1 || n > 13) return null;
   return n.toString().padStart(2, '0');
+}
+
+/* ── Contact name ─────────────────────────────────────────────────── */
+
+/**
+ * Strip the numeric ID prefix that PracticePanther prepends to contact names.
+ * "2658 - Paige Resendez"  →  "Paige Resendez"
+ * "Paige Resendez"         →  "Paige Resendez"  (unchanged)
+ */
+function extractClientName(contactStr) {
+  if (!contactStr) return '';
+  const m = contactStr.trim().match(/^\d+\s*-\s*(.+)/);
+  return m ? m[1].trim() : contactStr.trim();
 }
 
 /* ── Travel description parsing ───────────────────────────────────── */
@@ -221,7 +239,8 @@ function processRows(rows) {
     item:        findColumn('item'),
     hours:       findColumn('hrs.', 'hrs', 'hours', 'time', 'duration'),
     description: findColumn('descriptions', 'description', 'desc', 'notes'),
-    // "Is Time Entries Selected" is deliberately not mapped — it's ignored
+    status:      findColumn('status'),
+    // "Is Time Entries Selected", "Rate", "Total", "Billed By", "Matter" — all ignored
   };
 
   const errors = [];
@@ -237,9 +256,19 @@ function processRows(rows) {
 
   const entries = [];
   const warnings = [];
+  let skippedNonBillable = 0;
 
   rowsToProcess.forEach((row, idx) => {
     const rowNum = idx + 2; // 1-based, accounting for header
+
+    // Skip non-Billable rows (Billed, Paid, Not Billable, etc.)
+    if (cols.status >= 0) {
+      const status = (row[cols.status] || '').trim();
+      if (status && status !== 'Billable') {
+        skippedNonBillable++;
+        return;
+      }
+    }
 
     // Skip rows with blank item (not an activity entry)
     const itemVal = cols.item >= 0 ? row[cols.item] : '';
@@ -272,8 +301,8 @@ function processRows(rows) {
       return;
     }
 
-    // Client
-    const contact = cols.contact >= 0 ? row[cols.contact].trim() : '';
+    // Client — strip numeric prefix e.g. "2658 - Paige Resendez" → "Paige Resendez"
+    const contact = extractClientName(cols.contact >= 0 ? row[cols.contact] : '');
     if (!contact) {
       warnings.push(`Row ${rowNum}: blank contact — skipped`);
       return;
@@ -302,6 +331,10 @@ function processRows(rows) {
       rowNum,
     });
   });
+
+  if (skippedNonBillable > 0) {
+    warnings.unshift(`${skippedNonBillable} row(s) skipped — status is not "Billable" (already billed, paid, or marked not billable)`);
+  }
 
   return { entries, errors: [], warnings };
 }
