@@ -1,18 +1,16 @@
 /**
  * Content script for ebill.publiccounsel.net
- * Fills time entry forms from parsed billing data.
  *
- * Workflow per date entry:
- *  1. Click "Add new record"
- *  2. Fill date (M/D/YYYY) and hours for each activity item
- *  3. Click Save
- *  4. If any travel entries (item 12) exist for that date:
- *     a. Click the "Travel" button
- *     b. For each travel segment: Add new record → select Reason → From city → To city
- *        → Round trip checkbox → Time field → Save
- *     c. Click "Close Form"
- *     d. Dismiss any popup dialog ("OK")
- *  5. Repeat for next date
+ * Two-phase workflow:
+ *  Phase 1 – Work In Progress (WIP) grid page
+ *    Receives fillForm message → finds client row → clicks Edit.
+ *    Stores a queue in chrome.storage so the form page picks it up.
+ *
+ *  Phase 2 – Client ebill form page
+ *    On page load: checks storage for pending queue → fills entries for
+ *    the current client → shows progress overlay.
+ *    Also accepts a direct fillForm message when the user is already on
+ *    the form page.
  */
 
 // Activity code → column index in the ebill time-entry table (1-based after date column)
@@ -34,7 +32,6 @@ const CATEGORY_COLUMN_MAP = {
 
 const TRAVEL_REASONS = ['Court', 'Investigation', 'Research', 'Client Visit'];
 
-// US state abbreviations for detecting out-of-state cities
 const US_STATES = [
   'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA',
   'HI','ID','IL','IN','IA','KS','KY','LA','ME','MD',
@@ -43,24 +40,195 @@ const US_STATES = [
   'SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC',
 ];
 
-/* ── Message listener ── */
+/* ── Page detection ────────────────────────────────────────────────── */
+
+function isOnWIPGridPage() {
+  // Match the WIP grid page by the RadGrid1 element OR the UpdatePanel2 wrapper,
+  // even if td.rgSorted cells haven't rendered yet (Telerik loads async).
+  return !!(document.getElementById('RadGrid1') || document.getElementById('UpdatePanel2'));
+}
+
+function isOnFormPage() {
+  return !!document.getElementById('ebill-page');
+}
+
+/** Read client name from the read-only fields at the top of the form page. */
+function getFormPageClientName() {
+  const last  = document.getElementById('txtCliLast');
+  const first = document.getElementById('txtCliFirst');
+  if (!last || !first) return null;
+  const name = `${first.value.trim()} ${last.value.trim()}`.trim();
+  return name || null;
+}
+
+/* ── Client name matching ──────────────────────────────────────────── */
+
+/**
+ * Normalise a name for comparison: uppercase, strip commas, sort words.
+ * "RESENDEZ, PAIGE" and "Paige Resendez" both become "PAIGE RESENDEZ".
+ */
+function normalizeNameWords(name) {
+  return name.toUpperCase().replace(/,/g, ' ').split(/\s+/).filter(Boolean).sort().join(' ');
+}
+
+function namesMatch(a, b) {
+  return !!(a && b) && normalizeNameWords(a) === normalizeNameWords(b);
+}
+
+/* ── WIP grid helpers ──────────────────────────────────────────────── */
+
+/** Find the Edit button for a given client name in the WIP grid. */
+function findClientEditButton(clientName) {
+  // td.rgSorted holds the client name; search all table rows that have one
+  const nameCells = document.querySelectorAll('td.rgSorted');
+  for (const nameCell of nameCells) {
+    if (namesMatch(nameCell.textContent.trim(), clientName)) {
+      const row = nameCell.closest('tr');
+      if (!row) continue;
+      const btn = row.querySelector('input[value="Edit"]');
+      if (btn) return btn;
+    }
+  }
+  return null;
+}
+
+/* ── Storage helpers ───────────────────────────────────────────────── */
+
+async function getFillState() {
+  const { ebillFillState } = await chrome.storage.local.get('ebillFillState');
+  return ebillFillState || null;
+}
+
+async function setFillState(state) {
+  if (state) await chrome.storage.local.set({ ebillFillState: state });
+  else        await chrome.storage.local.remove('ebillFillState');
+}
+
+/* ── Filter parsed data for one client ────────────────────────────── */
+
+function dataForClient(parsedData, clientName) {
+  const groups = {};
+  for (const [key, group] of Object.entries(parsedData.groups)) {
+    if (namesMatch(group.contact, clientName)) groups[key] = group;
+  }
+  return { ...parsedData, groups };
+}
+
+/* ── Message listener ──────────────────────────────────────────────── */
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'fillForm') {
-    fillEbillForm(request.data)
+    handleFill(request.data)
       .then(() => sendResponse({ success: true }))
-      .catch(err  => sendResponse({ success: false, error: err.message }));
+      .catch(err => sendResponse({ success: false, error: err.message }));
     return true; // keep channel open for async response
   }
 });
 
-/* ── Main orchestration ─────────────────────────────────────────── */
+async function handleFill(parsedData) {
+  if (isOnWIPGridPage()) {
+    const clients = Object.keys(parsedData.groups);
+    if (!clients.length) throw new Error('No clients in parsed data');
+    await setFillState({ parsedData, queue: clients });
+    await processWIPQueue();
+
+  } else if (isOnFormPage()) {
+    const name     = getFormPageClientName();
+    const filtered = name ? dataForClient(parsedData, name) : parsedData;
+    if (!Object.keys(filtered.groups).length) {
+      throw new Error(
+        name
+          ? `No entries for "${name}" in parsed data — check the client name matches the billing file.`
+          : 'Cannot read client name from this page.'
+      );
+    }
+    await fillEbillForm(filtered);
+
+  } else {
+    throw new Error(
+      'Navigate to ebill.publiccounsel.net first — either the Work In Progress list or a client\'s form page.'
+    );
+  }
+}
+
+/* ── WIP grid phase ────────────────────────────────────────────────── */
+
+async function processWIPQueue() {
+  const state = await getFillState();
+  if (!state || !state.queue.length) { await setFillState(null); return; }
+
+  const next = state.queue[0];
+  const btn  = findClientEditButton(next);
+
+  if (!btn) {
+    // Client not found in WIP grid — skip and try the next one
+    showProgressOverlay(state.queue.length);
+    updateProgress(0, state.queue.length, `"${next}" not found in WIP grid — skipping`);
+    await setFillState({ ...state, queue: state.queue.slice(1) });
+    await delay(1200);
+    await processWIPQueue();
+    return;
+  }
+
+  showProgressOverlay(state.queue.length);
+  updateProgress(0, state.queue.length, `Opening form for ${next}…`);
+  await delay(300);
+  // Use native .click() — dispatchEvent with a synthetic MouseEvent does not
+  // reliably trigger ASP.NET form submission; native .click() always does.
+  btn.click();
+  // The page now navigates to the client form.
+  // init() on the form page will pick up from storage automatically.
+}
+
+/* ── Form page phase ───────────────────────────────────────────────── */
+
+/** Called from the init IIFE when the form page loads with pending state. */
+async function resumeOnFormPage(state) {
+  const name = getFormPageClientName();
+  if (!name) return;
+
+  // Find this client in the pending queue
+  const matchIdx = state.queue.findIndex(c => namesMatch(c, name));
+  if (matchIdx < 0) return; // not our client
+
+  // Remove from queue before filling (so navigating back won't re-fill)
+  const newQueue = state.queue.filter((_, i) => i !== matchIdx);
+  await setFillState(newQueue.length ? { ...state, queue: newQueue } : null);
+
+  const filtered = dataForClient(state.parsedData, name);
+  await fillEbillForm(filtered);
+
+  if (newQueue.length > 0) {
+    updateProgress(
+      state.queue.length - newQueue.length,
+      state.queue.length,
+      `Done with ${name}. Navigate back to WIP list to continue (${newQueue.length} remaining).`
+    );
+  }
+}
+
+/* ── Auto-resume on page load ──────────────────────────────────────── */
+
+(async function init() {
+  await delay(600); // let Telerik controls finish rendering
+  const state = await getFillState();
+  if (!state) return;
+
+  if (isOnFormPage()) {
+    await resumeOnFormPage(state);
+  } else if (isOnWIPGridPage() && state.queue && state.queue.length) {
+    // User navigated back to WIP — continue with next client in queue
+    await delay(400);
+    await processWIPQueue();
+  }
+})();
+
+/* ── Main fill orchestration ───────────────────────────────────────── */
 
 async function fillEbillForm(parsedData) {
   const allEntries = Object.values(parsedData.groups).flatMap(g => g.entries);
   if (!allEntries.length) throw new Error('No entries to fill');
 
-  // Group by date so we can handle travel per-date after the time entry is saved
   const byDate = {};
   allEntries.forEach(entry => {
     if (!byDate[entry.date]) byDate[entry.date] = [];
@@ -72,22 +240,19 @@ async function fillEbillForm(parsedData) {
 
   let done = 0;
   for (const date of dates) {
-    const dayEntries = byDate[date];
+    const dayEntries     = byDate[date];
     const regularEntries = dayEntries.filter(e => e.category !== 'travel');
     const travelEntries  = dayEntries.filter(e => e.category === 'travel');
 
-    // ── Step 1: fill regular time entries for this date ──
     for (const entry of regularEntries) {
       updateProgress(++done, allEntries.length, `Filling ${entry.date} — ${entry.categoryDisplay}`);
       await fillTimeEntry(entry);
       await delay(600);
     }
 
-    // ── Step 2: fill travel entries for this date ──
     if (travelEntries.length > 0) {
       for (const entry of travelEntries) {
         updateProgress(++done, allEntries.length, `Filling travel — ${entry.date}`);
-        // Save the time entry first, then open travel section
         await fillTimeEntry(entry);
         await delay(800);
         await fillTravelSection(entry);
@@ -100,69 +265,107 @@ async function fillEbillForm(parsedData) {
   setTimeout(hideProgressOverlay, 3000);
 }
 
-/* ── Time entry row ─────────────────────────────────────────────── */
+/* ── Time entry row ─────────────────────────────────────────────────── */
 
 async function fillTimeEntry(entry) {
-  const addBtn = findAddButton();
-  if (!addBtn) throw new Error('Cannot find "Add new record" button');
+  // Prefer the <a> link that fires __doPostBack (AJAX, no full page reload)
+  const addLink = document.querySelector('a[title="Add new record"]') || findAddButton();
+  if (!addLink) throw new Error('Cannot find "Add new record" button');
 
-  clickElement(addBtn);
-  await delay(400);
+  clickElement(addLink);
 
-  const row = findEditableRow();
-  if (!row) throw new Error('No editable row appeared after clicking Add');
+  // Poll for the edit row — AJAX can take > 400ms on slower connections
+  const row = await waitForEditRow(3000);
+  if (!row) throw new Error('Edit row did not appear after clicking Add new record');
 
-  // Fill date
-  const dateInput = findDateInputInRow(row);
-  if (dateInput) {
-    setInputValue(dateInput, entry.date);
-    await delay(150);
-  }
-
-  // Fill hours in the correct category column
-  await fillHoursInRow(row, entry);
+  // Set the date using Telerik's client API first, with a DOM fallback
+  await setTelerikDate(row, entry.date);
   await delay(200);
 
-  // Save
-  const saveBtn = findSaveButton();
+  // Fill hours using the specific udbCatN classes on this form
+  fillHoursInRow(row, entry);
+  await delay(150);
+
+  // Click Save — the button has class time-entry-insert on this form
+  const saveBtn = row.querySelector('input.time-entry-insert') ||
+                  row.querySelector('input[value="Save"]') ||
+                  findSaveButton();
   if (saveBtn) {
     clickElement(saveBtn);
-    await delay(500);
+    await delay(1000); // wait for AJAX save postback
   }
 
-  // Dismiss any system dialog that might appear
   dismissDialog();
 }
 
-async function fillHoursInRow(row, entry) {
+/** Poll for tr.rgEditRow to appear in the DOM (Telerik renders it via AJAX). */
+async function waitForEditRow(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const row = document.querySelector('tr.rgEditRow');
+    if (row) return row;
+    await delay(150);
+  }
+  return null;
+}
+
+/**
+ * Set the Telerik RadDatePicker value for the Date of Service field.
+ * Tries the Telerik $find() client API first; falls back to typing into
+ * the visible input and triggering Telerik's blur/change handler.
+ */
+async function setTelerikDate(row, dateStr) {
+  // The visible text input has class riTextBox inside a .time-entry-dos wrapper
+  const dateInput = row.querySelector('.time-entry-dos input.riTextBox') ||
+                    row.querySelector('input[id*="dosTextBox_dateInput"]');
+  if (!dateInput) return;
+
+  // Method 1: Telerik client API ($find is Telerik's Sys.Application.findComponent)
+  const pickerId = dateInput.id.replace(/_dateInput$/, '');
+  if (typeof $find === 'function') {
+    try {
+      const picker = $find(pickerId);
+      if (picker && typeof picker.set_selectedDate === 'function') {
+        const [m, d, y] = dateStr.split('/').map(Number);
+        picker.set_selectedDate(new Date(y, m - 1, d));
+        return;
+      }
+    } catch (_) { /* fall through to Method 2 */ }
+  }
+
+  // Method 2: Set the visible input value and fire Telerik's blur handler
+  dateInput.focus();
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+  if (setter) setter.set.call(dateInput, dateStr);
+  else dateInput.value = dateStr;
+  dateInput.dispatchEvent(new Event('input',  { bubbles: true }));
+  dateInput.dispatchEvent(new Event('change', { bubbles: true }));
+  dateInput.dispatchEvent(new Event('blur',   { bubbles: false })); // blur doesn't bubble
+  dateInput.blur();
+}
+
+function fillHoursInRow(row, entry) {
   const colIdx = CATEGORY_COLUMN_MAP[entry.category];
+  if (!colIdx || colIdx === 12) return; // 12 = travel, handled by fillTravelSection
 
-  // Strategy 1: use column index — skip the date cell (index 0) and find the Nth input
+  // Primary: the form uses time-entry-udb-catN classes on each input
+  const catInput = row.querySelector(`.time-entry-udb-cat${colIdx}`);
+  if (catInput) {
+    setInputValue(catInput, String(entry.hours));
+    return;
+  }
+
+  // Fallback: positional (allInputs[0]=date, allInputs[1]=cat1, …)
   const allInputs = Array.from(row.querySelectorAll('input:not([type="hidden"])'))
-    .filter(inp => isVisible(inp));
-
-  if (colIdx && allInputs.length > colIdx) {
+    .filter(isVisible);
+  if (allInputs.length > colIdx) {
     setInputValue(allInputs[colIdx], String(entry.hours));
-    return;
-  }
-
-  // Strategy 2: match by column header keyword
-  const input = findInputByCategory(row, entry.category);
-  if (input) {
-    setInputValue(input, String(entry.hours));
-    return;
-  }
-
-  // Strategy 3: use second visible input as fallback
-  if (allInputs.length > 1) {
-    setInputValue(allInputs[1], String(entry.hours));
   }
 }
 
-/* ── Travel section ─────────────────────────────────────────────── */
+/* ── Travel section ─────────────────────────────────────────────────── */
 
 async function fillTravelSection(entry) {
-  // Click the "Travel" button on the page
   const travelBtn = findButtonByText('Travel');
   if (!travelBtn) {
     console.warn('Ebill Auto-Filler: Travel button not found');
@@ -171,10 +374,8 @@ async function fillTravelSection(entry) {
   clickElement(travelBtn);
   await delay(600);
 
-  // Travel segments: each travelInfo object in the entry
   const segments = (entry.travelInfos || []).filter(Boolean);
   if (segments.length === 0) {
-    // No structured info — add one generic travel record
     await addTravelRecord(entry, { reason: null, fromCity: null, toCity: null });
   } else {
     for (const seg of segments) {
@@ -183,25 +384,21 @@ async function fillTravelSection(entry) {
     }
   }
 
-  // Close the travel form
   const closeBtn = findButtonByText('Close Form') || findButtonByText('Close');
   if (closeBtn) {
     clickElement(closeBtn);
     await delay(400);
   }
 
-  // Dismiss any popup dialog
   dismissDialog();
 }
 
 async function addTravelRecord(entry, seg) {
-  // Click "Add new record" inside the travel section
   const addBtn = findAddButton();
   if (!addBtn) return;
   clickElement(addBtn);
   await delay(400);
 
-  // Reason dropdown
   if (seg.reason) {
     const reasonSelect = findSelectByLabel('reason') || findSelectByPosition(0);
     if (reasonSelect) {
@@ -210,30 +407,26 @@ async function addTravelRecord(entry, seg) {
     }
   }
 
-  // From city
   if (seg.fromCity) {
     await selectCity('from', seg.fromCity);
     await delay(200);
   }
 
-  // To city
   if (seg.toCity) {
     await selectCity('to', seg.toCity);
     await delay(200);
   }
 
-  // Round trip — from parsed travel info or fallback to description text
   const isRoundTrip = seg.isRoundTrip ||
     (entry.description && /\bRT\b|round\s*trip/i.test(entry.description));
   if (isRoundTrip) {
     const rtCheck = findCheckboxByLabel('round') || document.querySelector('input[type="checkbox"]');
     if (rtCheck && !rtCheck.checked) {
       clickElement(rtCheck);
-      await delay(1500); // site recalculates mileage after round-trip toggle
+      await delay(1500);
     }
   }
 
-  // Time field (hours)
   const timeInput = findInputByLabel('time') ||
     document.querySelector('input[name*="time"], input[name*="Time"], input[id*="time"]');
   if (timeInput) {
@@ -241,7 +434,6 @@ async function addTravelRecord(entry, seg) {
     await delay(200);
   }
 
-  // Save
   const saveBtn = findSaveButton();
   if (saveBtn) {
     clickElement(saveBtn);
@@ -251,38 +443,29 @@ async function addTravelRecord(entry, seg) {
   dismissDialog();
 }
 
-/**
- * Select a city in a From or To dropdown.
- * Handles in-state (dropdown only) and out-of-state (extra city + state dropdowns).
- */
 async function selectCity(fromOrTo, cityName) {
-  // Find the correct select by label proximity or name attribute
   const labelText = fromOrTo === 'from' ? 'from' : 'to';
   const citySelect = findSelectByLabel(labelText) || findSelectByPosition(fromOrTo === 'from' ? 1 : 2);
   if (!citySelect) return;
 
-  // Try to find the city option directly in the dropdown
   const directOption = findOptionContaining(citySelect, cityName);
   if (directOption) {
     setSelectValue(citySelect, directOption.value);
     return;
   }
 
-  // Not in dropdown — might be an out-of-state city; look for "Out of State" option
   const outOfStateOption = findOptionContaining(citySelect, 'out of state') ||
     findOptionContaining(citySelect, 'other');
   if (outOfStateOption) {
     setSelectValue(citySelect, outOfStateOption.value);
-    await delay(300); // wait for extra fields to appear
+    await delay(300);
 
-    // Type city name in the free-text input
     const cityInput = document.querySelector('input[name*="city"], input[id*="city"], input[placeholder*="city" i]');
     if (cityInput) {
       setInputValue(cityInput, cityName);
       await delay(150);
     }
 
-    // Select state — try to detect a state abbreviation in the city string
     const stateMatch = cityName.match(/,\s*([A-Z]{2})$/);
     if (stateMatch && US_STATES.includes(stateMatch[1])) {
       const stateSelect = document.querySelector('select[name*="state"], select[id*="state"]');
@@ -294,7 +477,7 @@ async function selectCity(fromOrTo, cityName) {
   }
 }
 
-/* ── DOM helpers ─────────────────────────────────────────────────── */
+/* ── DOM helpers ─────────────────────────────────────────────────────── */
 
 function findAddButton() {
   const all = document.querySelectorAll('button, input[type="button"], input[type="submit"], a, [role="button"]');
@@ -303,7 +486,6 @@ function findAddButton() {
     if (text.includes('add') && (text.includes('record') || text.includes('new') || text === 'add')) {
       return el;
     }
-    // "+" icon button next to "add new record" text
     if (el.title && el.title.toLowerCase().includes('add')) return el;
   }
   return null;
@@ -324,20 +506,26 @@ function findSaveButton() {
 }
 
 function findEditableRow() {
-  const rows = document.querySelectorAll('tr');
-  // Prefer the last row with visible inputs (newly added row is typically last)
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const inputs = Array.from(rows[i].querySelectorAll('input:not([type="hidden"])')).filter(isVisible);
-    if (inputs.length > 1) return rows[i];
-  }
-  return null;
+  // Telerik RadGrid marks the insert/edit row with rgEditRow
+  return document.querySelector('tr.rgEditRow') || (() => {
+    // Fallback: last tr with multiple visible inputs
+    const rows = document.querySelectorAll('tr');
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const inputs = Array.from(rows[i].querySelectorAll('input:not([type="hidden"])')).filter(isVisible);
+      if (inputs.length > 1) return rows[i];
+    }
+    return null;
+  })();
 }
 
 function findDateInputInRow(row) {
-  // Try name/id attributes first
+  // Specific to this form: date input is .riTextBox inside .time-entry-dos
+  const specific = row.querySelector('.time-entry-dos input.riTextBox') ||
+                   row.querySelector('input[id*="dosTextBox_dateInput"]');
+  if (specific && isVisible(specific)) return specific;
+  // Generic fallback
   let input = row.querySelector('input[name*="date" i], input[id*="date" i]');
   if (input && isVisible(input)) return input;
-  // Fall back to first visible text input
   const inputs = Array.from(row.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisible);
   return inputs[0] || null;
 }
@@ -359,7 +547,7 @@ function findInputByCategory(row, category) {
     'other_clt_contact':   ['other', 'other contact'],
   };
 
-  const terms = keywords[category] || [];
+  const terms   = keywords[category] || [];
   const headers = document.querySelectorAll('th');
 
   for (let i = 0; i < headers.length; i++) {
@@ -376,8 +564,7 @@ function findInputByCategory(row, category) {
 }
 
 function findSelectByLabel(labelFragment) {
-  const frag = labelFragment.toLowerCase();
-  // Try label elements
+  const frag   = labelFragment.toLowerCase();
   const labels = document.querySelectorAll('label');
   for (const lbl of labels) {
     if (lbl.textContent.toLowerCase().includes(frag)) {
@@ -385,7 +572,6 @@ function findSelectByLabel(labelFragment) {
       if (sel && sel.tagName === 'SELECT') return sel;
     }
   }
-  // Try name/id attributes
   return document.querySelector(`select[name*="${frag}" i], select[id*="${frag}" i]`) || null;
 }
 
@@ -405,7 +591,7 @@ function findOptionContaining(select, text) {
 }
 
 function findCheckboxByLabel(labelFragment) {
-  const frag = labelFragment.toLowerCase();
+  const frag   = labelFragment.toLowerCase();
   const labels = document.querySelectorAll('label');
   for (const lbl of labels) {
     if (lbl.textContent.toLowerCase().includes(frag)) {
@@ -417,7 +603,7 @@ function findCheckboxByLabel(labelFragment) {
 }
 
 function findInputByLabel(labelFragment) {
-  const frag = labelFragment.toLowerCase();
+  const frag   = labelFragment.toLowerCase();
   const labels = document.querySelectorAll('label');
   for (const lbl of labels) {
     if (lbl.textContent.toLowerCase().includes(frag)) {
@@ -428,7 +614,6 @@ function findInputByLabel(labelFragment) {
   return null;
 }
 
-/** Dismiss any open confirm/alert dialog by clicking an OK button */
 function dismissDialog() {
   const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"]');
   for (const btn of btns) {
@@ -445,25 +630,14 @@ function isVisible(el) {
   return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
 }
 
-/**
- * Click an element using Method 2 (full MouseEvent dispatch) — confirmed working
- * on ebill.publiccounsel.net. Falls back to native .click() if dispatch is cancelled.
- */
 function clickElement(el) {
-  const evt = new MouseEvent('click', {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-  });
+  const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
   const notCancelled = el.dispatchEvent(evt);
-  // If the event was cancelled by the page (preventDefault), fall back to .click()
   if (!notCancelled) el.click();
 }
 
-/** Set an input value and fire the events that the page might listen for. */
 function setInputValue(input, value) {
   input.focus();
-  // Use native setter to bypass React/Vue value tracking
   const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
   if (nativeSetter) nativeSetter.set.call(input, value);
   else input.value = value;
@@ -474,9 +648,7 @@ function setInputValue(input, value) {
   input.blur();
 }
 
-/** Set a select value and fire change event. */
 function setSelectValue(select, value) {
-  // Try to match by value or text
   let found = false;
   for (const opt of select.options) {
     if (opt.value === value || opt.text === value ||
@@ -494,7 +666,7 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/* ── Progress overlay ────────────────────────────────────────────── */
+/* ── Progress overlay ────────────────────────────────────────────────── */
 
 let overlayEl = null;
 
@@ -527,11 +699,11 @@ function updateProgress(current, total, message) {
   const txt = document.getElementById('ebill-progress-text');
   const bar = document.getElementById('ebill-progress-bar');
   if (txt) txt.textContent = message || `Processing ${current} of ${total}…`;
-  if (bar) bar.style.width = `${(current / total) * 100}%`;
+  if (bar) bar.style.width = `${total > 0 ? (current / total) * 100 : 0}%`;
 }
 
 function hideProgressOverlay() {
   if (overlayEl) { overlayEl.remove(); overlayEl = null; }
 }
 
-console.log('Ebill Auto-Filler v1.1 content script loaded');
+console.log('Ebill Auto-Filler v1.2 content script loaded');

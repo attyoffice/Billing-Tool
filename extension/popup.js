@@ -99,9 +99,12 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       await chrome.storage.local.set({ billingData: parsedData });
 
-      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      // Search all windows — the popup is its own window, so lastFocusedWindow
+      // would return popup.html, not the ebill tab.
+      const allTabs = await chrome.tabs.query({});
+      const tab = allTabs.find(t => t.url && t.url.includes('ebill.publiccounsel.net'));
 
-      if (!tab || !tab.url || !tab.url.includes('ebill.publiccounsel.net')) {
+      if (!tab) {
         showStatus('Please navigate to ebill.publiccounsel.net first, then click Fill again.', 'info');
         return;
       }
